@@ -42,7 +42,8 @@ MONA_LISA = MONA_LISA_CANDIDATES[0]
 
 @app.function(image=image, volumes={OUT: volume}, gpu="T4", timeout=3600)
 def paint(url: str = MONA_LISA, res: int = 224, steps: int = 250,
-          codes: int = 512, grid: int = 128, seed: int = 0):
+          codes: int = 512, grid: int = 128, anim_frames: int = 100,
+          seed: int = 0):
     import io
     import json
     import numpy as np
@@ -228,6 +229,32 @@ def paint(url: str = MONA_LISA, res: int = 224, steps: int = 250,
           f"(grid={grid} coord tokens + K={used} brush tokens, ~{bits} bits)")
     token_ids = brush_tok.tolist()
 
+    # ---- animation: replay tokenized strokes in paint order (coarse->fine) ----
+    def frame_img(canvas):
+        arr = (canvas.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255)
+        return Image.fromarray(arr.astype(np.uint8))
+
+    with torch.no_grad():
+        x0, y0, x1, y1 = geo_q[:, 0], geo_q[:, 1], geo_q[:, 2], geo_q[:, 3]
+        w = appr_q[:, 0].clamp(min=2.0 / res)
+        col = appr_q[:, 1:4].clamp(0, 1)
+        a = appr_q[:, 4].clamp(0, 1)
+        canvas = base.clone()
+        frames = [frame_img(canvas)]
+        step = max(1, N // anim_frames)
+        for i in range(0, N, step):
+            s = slice(i, min(i + step, N))
+            canvas = render(canvas, (x0[s], y0[s], x1[s], y1[s],
+                                     w[s], col[s], a[s]))
+            frames.append(frame_img(canvas))
+    durations = [70] * len(frames)
+    durations[0] = 500      # hold the underpainting
+    durations[-1] = 2500    # hold the finished painting
+    frames[0].save(f"{OUT}/drawing.gif", save_all=True,
+                   append_images=frames[1:], duration=durations, loop=0,
+                   optimize=True)
+    print(f"saved drawing.gif ({len(frames)} frames)")
+
     # ---- save artifacts ----
     def to_np(t):
         return t.detach().cpu().permute(1, 2, 0).numpy()
@@ -295,7 +322,9 @@ def _sample_color(target, cx, cy, res):
 
 
 @app.local_entrypoint()
-def main(res: int = 224, steps: int = 250, codes: int = 512, grid: int = 128):
-    result = paint.remote(res=res, steps=steps, codes=codes, grid=grid)
+def main(res: int = 224, steps: int = 250, codes: int = 512, grid: int = 128,
+         anim_frames: int = 100):
+    result = paint.remote(res=res, steps=steps, codes=codes, grid=grid,
+                          anim_frames=anim_frames)
     print("RESULT:", result)
     print("pull: modal volume get brush-paint /out ./paint_out")

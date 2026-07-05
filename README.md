@@ -9,6 +9,12 @@ cannot rescue what the model cannot produce"*). Strokes are a compositional,
 inspectable visual substrate. This repo builds the tokenizers and renderers to
 test whether letting models *draw* their reasoning adds capability text can't.
 
+![Painting the Mona Lisa from brush tokens](assets/drawing_mona_lisa.gif)
+
+*The 1020 tokenized brush strokes replayed in paint order (coarse → fine): a
+blurred underpainting, then strokes laid down one batch at a time until the
+finished portrait.*
+
 ![Mona Lisa from brush tokens](assets/mona_lisa_brush_tokens.png)
 
 *Left: target. Middle: 1020 continuous brush strokes (MSE 0.0007). Right: fully
@@ -59,8 +65,9 @@ modal run paint.py --steps 300 --codes 256
 modal volume get brush-paint /out ./paint_out    # compare.png, tokens.json, ...
 ```
 
-Outputs `target | continuous | tokenized` comparison, per-layer progression, and
-`tokens.json` (the brush-token sequence + codebook).
+Outputs `target | continuous | tokenized` comparison, per-layer progression, a
+`drawing.gif` of the strokes being laid down in order, and `tokens.json` (the
+brush-token sequence + codebook).
 
 ![Painting progression](assets/painting_progression.png)
 
