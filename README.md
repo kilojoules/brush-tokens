@@ -11,16 +11,16 @@ test whether letting models *draw* their reasoning adds capability text can't.
 
 ![Painting the Mona Lisa from brush tokens](assets/drawing_mona_lisa.gif)
 
-*The 1020 tokenized brush strokes replayed in paint order (coarse → fine): a
-blurred underpainting, then strokes laid down one batch at a time until the
-finished portrait.*
+*Starting from a blank white canvas, the 1220 tokenized brush strokes are
+replayed in paint order (coarse block-in → fine detail), one batch per frame,
+until the finished portrait.*
 
 ![Mona Lisa from brush tokens](assets/mona_lisa_brush_tokens.png)
 
-*Left: target. Middle: 1020 continuous brush strokes (MSE 0.0007). Right: fully
-tokenized — each stroke is **4 coordinate tokens (128-bin grid) + 1 brush token
-(512-code appearance codebook)** — re-rendered at MSE 0.0020, near-identical to
-the continuous fit.*
+*Left: target. Middle: 1220 continuous brush strokes on a blank canvas
+(MSE 0.0007). Right: fully tokenized — each stroke is **4 coordinate tokens
+(128-bin grid) + 1 brush token (512-code appearance codebook)** — re-rendered at
+MSE 0.0023, near-identical to the continuous fit.*
 
 ## What's here
 
@@ -51,7 +51,8 @@ raster (default: the Mona Lisa, public domain), then **tokenizes every stroke**
 and re-renders — the painting reproduced from a fully discrete token stream.
 
 - Capsule strokes (segment + width + RGBA), soft coverage, alpha compositing.
-- Coarse-to-fine layers over a blurred underpainting (~1020 strokes).
+- Coarse-to-fine layers on a blank white canvas (~1220 strokes): a big block-in
+  layer covers the canvas, finer layers add detail.
 - Tokenization mirrors real stroke-token models (DeepSVG, StrokeNUWA):
   **geometry → coordinate tokens** (snap to a 128-bin grid) and **appearance
   (width/color/opacity) → a 512-code brush codebook** (k-means). Each stroke =

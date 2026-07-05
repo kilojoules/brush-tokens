@@ -145,11 +145,12 @@ def paint(url: str = MONA_LISA, res: int = 224, steps: int = 250,
             canvas = canvas * (1 - alpha) + col[i].view(3, 1, 1) * alpha
         return canvas
 
-    # underpainting: heavily blurred target
-    base = blur(target, 31).detach()
+    # start from a blank white canvas — strokes must cover everything themselves
+    # (no blurred underpainting to lean on), so the first layer is a big block-in.
+    base = torch.ones(3, res, res, device=dev)
 
     # coarse-to-fine layers: (n_strokes, stroke scale)
-    plan = [(100, 0.45), (200, 0.22), (320, 0.11), (400, 0.06)]
+    plan = [(180, 0.55), (260, 0.28), (360, 0.13), (420, 0.07)]
     layers = []
     snapshots = []
     canvas0 = base.clone()
@@ -272,7 +273,7 @@ def paint(url: str = MONA_LISA, res: int = 224, steps: int = 250,
     fig.savefig(f"{OUT}/compare.png", dpi=130)
 
     fig2, ax2 = plt.subplots(1, len(snapshots) + 1, figsize=(4 * (len(snapshots) + 1), 4))
-    ax2[0].imshow(to_np(base)); ax2[0].set_title("underpaint")
+    ax2[0].imshow(to_np(base)); ax2[0].set_title("blank canvas")
     for i, snap in enumerate(snapshots):
         ax2[i + 1].imshow(snap.permute(1, 2, 0).numpy())
         ax2[i + 1].set_title(f"after layer {i}")
