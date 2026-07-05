@@ -9,6 +9,12 @@ cannot rescue what the model cannot produce"*). Strokes are a compositional,
 inspectable visual substrate. This repo builds the tokenizers and renderers to
 test whether letting models *draw* their reasoning adds capability text can't.
 
+![Mona Lisa from brush tokens](assets/mona_lisa_brush_tokens.png)
+
+*Left: target. Middle: 440 continuous brush strokes (MSE 0.001). Right: the same
+painting snapped to a **256-code brush-token vocabulary** and re-rendered
+(MSE 0.009).*
+
 ## What's here
 
 ### `modal_vq_stroke.py` — stroke VQ tokenizer
@@ -26,6 +32,10 @@ strokes.
 modal run modal_vq_stroke.py --categories cat,face,apple --epochs 20
 modal volume get stroke-vq /out ./out    # checkpoint + recon.png
 ```
+
+![QuickDraw VQ reconstructions](assets/quickdraw_vq_recon.png)
+
+*Top: original sketches. Bottom: reconstructed from 512 discrete stroke codes.*
 
 ### `paint.py` — paint an image with brush-stroke tokens
 Differentiable stroke-based rendering (the *Learning to Paint* family). Optimizes
@@ -45,6 +55,11 @@ modal volume get brush-paint /out ./paint_out    # compare.png, tokens.json, ...
 
 Outputs `target | continuous | tokenized` comparison, per-layer progression, and
 `tokens.json` (the brush-token sequence + codebook).
+
+![Painting progression](assets/painting_progression.png)
+
+*Coarse-to-fine: blurred underpainting → 80 coarse → 140 medium → 220 fine
+strokes.*
 
 ## Roadmap
 
