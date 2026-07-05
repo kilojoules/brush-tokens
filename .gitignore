@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+out/
+paint_out/
+*.pt
+.DS_Store
