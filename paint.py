@@ -31,20 +31,18 @@ image = (
 volume = modal.Volume.from_name("brush-paint", create_if_missing=True)
 OUT = "/out"
 
-# Public-domain Mona Lisa (Wikimedia Commons). Wikimedia only serves a fixed
-# set of thumbnail widths, so we try several standard ones, then the original.
+# Public-domain Mona Lisa (Wikimedia Commons). Wikimedia rejects arbitrary
+# thumbnail widths (400), so fetch the original file directly.
 _ML_FILE = "Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg"
-_ML_THUMB = ("https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/"
-             f"{_ML_FILE}/{{w}}px-{_ML_FILE}")
-MONA_LISA_CANDIDATES = [_ML_THUMB.format(w=w) for w in (800, 640, 1024, 320)]
-MONA_LISA_CANDIDATES.append(
-    f"https://upload.wikimedia.org/wikipedia/commons/e/ec/{_ML_FILE}")
+MONA_LISA_CANDIDATES = [
+    f"https://upload.wikimedia.org/wikipedia/commons/e/ec/{_ML_FILE}",
+]
 MONA_LISA = MONA_LISA_CANDIDATES[0]
 
 
 @app.function(image=image, volumes={OUT: volume}, gpu="T4", timeout=3600)
-def paint(url: str = MONA_LISA, res: int = 224, steps: int = 300,
-          codes: int = 256, seed: int = 0):
+def paint(url: str = MONA_LISA, res: int = 224, steps: int = 250,
+          codes: int = 512, grid: int = 128, seed: int = 0):
     import io
     import json
     import numpy as np
@@ -58,7 +56,7 @@ def paint(url: str = MONA_LISA, res: int = 224, steps: int = 300,
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     g = torch.Generator(device=dev).manual_seed(seed)
-    print(f"device={dev} res={res} steps={steps} codes={codes}")
+    print(f"device={dev} res={res} steps={steps} codes={codes} grid={grid}")
 
     # ---- load target ----
     hdr = {"User-Agent": "brush-paint/0.1 (research; contact juqu@dtu.dk)"}
@@ -150,7 +148,7 @@ def paint(url: str = MONA_LISA, res: int = 224, steps: int = 300,
     base = blur(target, 31).detach()
 
     # coarse-to-fine layers: (n_strokes, stroke scale)
-    plan = [(80, 0.45), (140, 0.22), (220, 0.10)]
+    plan = [(100, 0.45), (200, 0.22), (320, 0.11), (400, 0.06)]
     layers = []
     snapshots = []
     canvas0 = base.clone()
@@ -179,49 +177,56 @@ def paint(url: str = MONA_LISA, res: int = 224, steps: int = 300,
     final_mse = F.mse_loss(continuous, target).item()
     print(f"continuous MSE={final_mse:.5f}")
 
-    # ---- collect all strokes -> feature matrix for VQ ----
-    feats, meta = [], []
+    # ---- tokenize: geometry -> coordinate grid, appearance -> brush codebook ----
+    # k-means on absolute positions averages strokes across the image (blocky
+    # mess). Instead: snap coordinates to a G-bin grid (coordinate tokens, no
+    # averaging), and VQ only the appearance [w,r,g,b,alpha] into a brush
+    # codebook. Each stroke = 4 coordinate tokens + 1 brush token, fully discrete.
+    geo, appr = [], []
     for layer in layers:
         x0, y0, x1, y1, w, col, a = [t.detach() for t in layer.strokes()]
         for i in range(x0.shape[0]):
-            feats.append([x0[i].item(), y0[i].item(), x1[i].item(),
-                          y1[i].item(), w[i].item(),
-                          col[i, 0].item(), col[i, 1].item(), col[i, 2].item(),
-                          a[i].item()])
-            meta.append(len(meta))
-    feats = torch.tensor(feats, device=dev)  # (N,9)
-    N = feats.shape[0]
+            geo.append([x0[i].item(), y0[i].item(), x1[i].item(), y1[i].item()])
+            appr.append([w[i].item(), col[i, 0].item(), col[i, 1].item(),
+                         col[i, 2].item(), a[i].item()])
+    geo = torch.tensor(geo, device=dev)    # (N,4) in [0,1]
+    appr = torch.tensor(appr, device=dev)  # (N,5)
+    N = geo.shape[0]
     print(f"total strokes N={N}")
 
-    # standardize, k-means codebook
-    mu, sd = feats.mean(0), feats.std(0) + 1e-6
-    fz = (feats - mu) / sd
+    # coordinate tokens: snap to G bins, dequantize
+    coord_tok = (geo.clamp(0, 1) * (grid - 1)).round().long()  # (N,4) in [0,G)
+    geo_q = coord_tok.float() / (grid - 1)
+
+    # brush codebook: k-means over standardized appearance
+    mu, sd = appr.mean(0), appr.std(0) + 1e-6
+    az = (appr - mu) / sd
     K = min(codes, N)
-    cb = fz[torch.randperm(N, generator=g, device=dev)[:K]].clone()
-    for _ in range(30):
-        d = torch.cdist(fz, cb)
-        assign = d.argmin(1)
+    cb = az[torch.randperm(N, generator=g, device=dev)[:K]].clone()
+    for _ in range(40):
+        assign = torch.cdist(az, cb).argmin(1)
         for k in range(K):
             m = assign == k
             if m.any():
-                cb[k] = fz[m].mean(0)
-    token_ids = assign.tolist()
-    used = len(set(token_ids))
-    print(f"brush-token codebook: {used}/{K} codes used across {N} strokes")
+                cb[k] = az[m].mean(0)
+    brush_tok = assign
+    used = len(set(brush_tok.tolist()))
+    appr_q = (cb * sd + mu)[assign]  # (N,5) snapped appearance
+    print(f"brush codebook: {used}/{K} codes used across {N} strokes")
 
-    # de-standardize codebook -> stroke params, re-render tokenized painting
-    cb_params = cb * sd + mu
-    tok_strokes = cb_params[assign]  # (N,9) each stroke snapped to its code
+    # re-render from tokens: grid coords + codebook brush
     with torch.no_grad():
         tcanvas = base.clone()
-        x0, y0, x1, y1 = (tok_strokes[:, 0], tok_strokes[:, 1],
-                          tok_strokes[:, 2], tok_strokes[:, 3])
-        w = tok_strokes[:, 4].clamp(min=2.0 / res)
-        col = tok_strokes[:, 5:8].clamp(0, 1)
-        a = tok_strokes[:, 8].clamp(0, 1)
+        x0, y0, x1, y1 = geo_q[:, 0], geo_q[:, 1], geo_q[:, 2], geo_q[:, 3]
+        w = appr_q[:, 0].clamp(min=2.0 / res)
+        col = appr_q[:, 1:4].clamp(0, 1)
+        a = appr_q[:, 4].clamp(0, 1)
         tcanvas = render(tcanvas, (x0, y0, x1, y1, w, col, a)).clamp(0, 1)
     tok_mse = F.mse_loss(tcanvas, target).item()
-    print(f"tokenized MSE={tok_mse:.5f} (K={K} brush tokens)")
+    bits = N * (4 * (grid - 1).bit_length() + (K - 1).bit_length())
+    print(f"tokenized MSE={tok_mse:.5f} "
+          f"(grid={grid} coord tokens + K={used} brush tokens, ~{bits} bits)")
+    token_ids = brush_tok.tolist()
 
     # ---- save artifacts ----
     def to_np(t):
@@ -232,7 +237,8 @@ def paint(url: str = MONA_LISA, res: int = 224, steps: int = 300,
     ax[1].imshow(to_np(continuous))
     ax[1].set_title(f"continuous (N={N})\nMSE={final_mse:.4f}")
     ax[2].imshow(to_np(tcanvas))
-    ax[2].set_title(f"brush tokens (K={used})\nMSE={tok_mse:.4f}")
+    ax[2].set_title(f"tokens (coord grid {grid} + {used} brushes)"
+                    f"\nMSE={tok_mse:.4f}")
     for a_ in ax:
         a_.axis("off")
     fig.tight_layout()
@@ -255,13 +261,14 @@ def paint(url: str = MONA_LISA, res: int = 224, steps: int = 300,
 
     with open(f"{OUT}/tokens.json", "w") as f:
         json.dump({
-            "token_ids": token_ids,
+            "coord_tokens": coord_tok.detach().cpu().tolist(),  # (N,4) in [0,grid)
+            "brush_tokens": token_ids,                          # (N,) in [0,K)
+            "grid": grid,
             "codebook_size": K,
             "codes_used": used,
             "n_strokes": N,
-            "feature_order": ["x0", "y0", "x1", "y1", "w",
-                              "r", "g", "b", "alpha"],
-            "codebook": cb_params.detach().cpu().tolist(),
+            "brush_order": ["w", "r", "g", "b", "alpha"],
+            "brush_codebook": (cb * sd + mu).detach().cpu().tolist(),
             "continuous_mse": final_mse,
             "tokenized_mse": tok_mse,
         }, f)
@@ -288,7 +295,7 @@ def _sample_color(target, cx, cy, res):
 
 
 @app.local_entrypoint()
-def main(res: int = 224, steps: int = 300, codes: int = 256):
-    result = paint.remote(res=res, steps=steps, codes=codes)
+def main(res: int = 224, steps: int = 250, codes: int = 512, grid: int = 128):
+    result = paint.remote(res=res, steps=steps, codes=codes, grid=grid)
     print("RESULT:", result)
     print("pull: modal volume get brush-paint /out ./paint_out")

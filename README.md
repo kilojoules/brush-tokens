@@ -11,9 +11,10 @@ test whether letting models *draw* their reasoning adds capability text can't.
 
 ![Mona Lisa from brush tokens](assets/mona_lisa_brush_tokens.png)
 
-*Left: target. Middle: 440 continuous brush strokes (MSE 0.001). Right: the same
-painting snapped to a **256-code brush-token vocabulary** and re-rendered
-(MSE 0.009).*
+*Left: target. Middle: 1020 continuous brush strokes (MSE 0.0007). Right: fully
+tokenized — each stroke is **4 coordinate tokens (128-bin grid) + 1 brush token
+(512-code appearance codebook)** — re-rendered at MSE 0.0020, near-identical to
+the continuous fit.*
 
 ## What's here
 
@@ -40,13 +41,18 @@ modal volume get stroke-vq /out ./out    # checkpoint + recon.png
 ### `paint.py` — paint an image with brush-stroke tokens
 Differentiable stroke-based rendering (the *Learning to Paint* family). Optimizes
 a set of colored capsule brush strokes coarse-to-fine to reconstruct a target
-raster (default: the Mona Lisa, public domain), then **VQ-quantizes the strokes
-into a discrete brush-token codebook** and re-renders — the painting reproduced
-from a finite brush vocabulary.
+raster (default: the Mona Lisa, public domain), then **tokenizes every stroke**
+and re-renders — the painting reproduced from a fully discrete token stream.
 
 - Capsule strokes (segment + width + RGBA), soft coverage, alpha compositing.
-- Coarse-to-fine layers over a blurred underpainting.
-- k-means codebook over stroke params → each stroke becomes an 8-bit brush token.
+- Coarse-to-fine layers over a blurred underpainting (~1020 strokes).
+- Tokenization mirrors real stroke-token models (DeepSVG, StrokeNUWA):
+  **geometry → coordinate tokens** (snap to a 128-bin grid) and **appearance
+  (width/color/opacity) → a 512-code brush codebook** (k-means). Each stroke =
+  4 coordinate tokens + 1 brush token.
+- Quantizing *absolute position* with k-means averages strokes across the image
+  (blocky mush); a coordinate grid preserves location and drops tokenized MSE
+  ~4× (0.009 → 0.002).
 
 ```bash
 modal run paint.py --steps 300 --codes 256
