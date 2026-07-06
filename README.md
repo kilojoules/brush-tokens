@@ -1,7 +1,7 @@
 # brush-tokens
 
-Discrete **brush/stroke tokens** for images — a visual vocabulary of pen and
-paint strokes, and experiments in reasoning and rendering with them.
+A **shared, learned vocabulary of brush strokes** for images — plus the
+differentiable renderers and stroke tokenizers to build and use it.
 
 Motivation: text-token LLMs reason poorly about spatial structure (see
 [think-visually](https://github.com/kilojoules/think-visually) — *"a monitor
@@ -9,86 +9,104 @@ cannot rescue what the model cannot produce"*). Strokes are a compositional,
 inspectable visual substrate. This repo builds the tokenizers and renderers to
 test whether letting models *draw* their reasoning adds capability text can't.
 
-![Painting the Mona Lisa from brush tokens](assets/drawing_mona_lisa.gif)
+## A real brush vocabulary — `vocab.py`
 
-*Starting from a blank white canvas, the 1220 tokenized brush strokes are
-replayed in paint order (coarse block-in → fine detail), one batch per frame,
-until the finished portrait.*
+A brush is a *mark*, not a color: you dip the same brush in any paint. So the
+vocabulary is a codebook of **shapes** — `(length, width, bend)`, invariant to
+where it's placed, how it's rotated, and what color it is. It is learned **once**
+over a corpus of paintings and then reused, unchanged, on **held-out** images it
+never saw. That last part is the test the earlier per-image codebook failed.
 
-![Mona Lisa from brush tokens](assets/mona_lisa_brush_tokens.png)
+![Shared brush alphabet](assets/brush_alphabet.png)
 
-*Left: target. Middle: 1220 continuous brush strokes on a blank canvas
-(MSE 0.0007). Right: fully tokenized — each stroke is **4 coordinate tokens
-(128-bin grid) + 1 brush token (512-code appearance codebook)** — re-rendered at
-MSE 0.0023, near-identical to the continuous fit.*
+*The 32 learned brushes — distinct marks (thin/thick dashes, arcs, V's,
+checkmarks), color-free. Trained on 6 paintings (Starry Night, Girl with a Pearl
+Earring, American Gothic, La Grande Jatte, The Scream, Monet's Impression).*
 
-## What's here
+![Held-out reconstructions from the shared vocabulary](assets/heldout_vocab.png)
 
-### `modal_vq_stroke.py` — stroke VQ tokenizer
-A VQ-VAE over QuickDraw pen-stroke sequences (SketchRNN stroke-3 format). Learns
-a discrete codebook: any sketch → sequence of stroke-token IDs → reconstructed
-strokes.
+*Held-out (never in the corpus): each stroke's shape is snapped to one of the 32
+fixed brushes; only position/orientation/color are refit. The vocabulary-only
+paintings (right) match the unconstrained fit (middle) closely.*
+
+**Is it actually a vocabulary?** The numbers, versus the naive per-image k-means
+in `paint.py`:
+
+| | per-image k-means (`paint.py`) | **shared vocab (`vocab.py`)** |
+|---|---|---|
+| trained on | one image | 6-painting corpus |
+| singleton codes | 147 / 512 | **0 / 32** |
+| strokes per code (median) | ~1 | **91** |
+| codes reused across ≥2 images | — | **32 / 32** |
+| held-out reconstruction | n/a | **Mona Lisa MSE 0.0011** (free 0.0008) |
+
+Zero singletons, every brush used ~91×, every brush appears in ≥2 paintings, and
+the fixed alphabet reconstructs unseen images (Mona Lisa 0.0011, Vermeer's *View
+of Delft* 0.0025) almost as well as unconstrained strokes.
+
+```bash
+modal run vocab.py --k-brushes 32
+modal volume get brush-vocab /out ./vocab_out   # brush_alphabet.png, heldout_vocab.png, vocab.json
+```
+
+## Other pieces
+
+### `modal_vq_stroke.py` — stroke VQ tokenizer (line sketches)
+A VQ-VAE over QuickDraw pen-stroke sequences (SketchRNN stroke-3 format). Any
+sketch → sequence of stroke-token IDs → reconstructed strokes.
 
 - GRU encoder → per-step **EMA** vector quantizer → GRU decoder.
 - **Dead-code revival** resets unused codes each epoch (loss-based VQ collapsed
   to ~20/512; EMA + revival reaches full 509–512/512 utilization).
-- 350k sketches, 5 categories, ~20 min on a T4. Reconstructs recognizable
-  doodles from 512 discrete codes.
-
-```bash
-modal run modal_vq_stroke.py --categories cat,face,apple --epochs 20
-modal volume get stroke-vq /out ./out    # checkpoint + recon.png
-```
+- 350k sketches, ~20 min on a T4. Reconstructs recognizable doodles from 512
+  discrete codes.
 
 ![QuickDraw VQ reconstructions](assets/quickdraw_vq_recon.png)
 
 *Top: original sketches. Bottom: reconstructed from 512 discrete stroke codes.*
 
-### `paint.py` — paint an image with brush-stroke tokens
-Differentiable stroke-based rendering (the *Learning to Paint* family). Optimizes
-a set of colored capsule brush strokes coarse-to-fine to reconstruct a target
-raster (default: the Mona Lisa, public domain), then **tokenizes every stroke**
-and re-renders — the painting reproduced from a fully discrete token stream.
-
-- Capsule strokes (segment + width + RGBA), soft coverage, alpha compositing.
-- Coarse-to-fine layers on a blank white canvas (~1220 strokes): a big block-in
-  layer covers the canvas, finer layers add detail.
-- Tokenization mirrors real stroke-token models (DeepSVG, StrokeNUWA):
-  **geometry → coordinate tokens** (snap to a 128-bin grid) and **appearance
-  (width/color/opacity) → a 512-code brush codebook** (k-means). Each stroke =
-  4 coordinate tokens + 1 brush token.
-- Quantizing *absolute position* with k-means averages strokes across the image
-  (blocky mush); a coordinate grid preserves location and drops tokenized MSE
-  ~4× (0.009 → 0.002).
-
 ```bash
-modal run paint.py --steps 300 --codes 256
-modal volume get brush-paint /out ./paint_out    # compare.png, tokens.json, ...
+modal run modal_vq_stroke.py --categories cat,face,apple --epochs 20
 ```
 
-Outputs `target | continuous | tokenized` comparison, per-layer progression, a
-`drawing.gif` of the strokes being laid down in order, and `tokens.json` (the
-brush-token sequence + codebook).
+### `paint.py` — differentiable painter + per-image tokenization (demo)
+The renderer and a visual demo, **not** the shared vocabulary. Optimizes colored
+capsule strokes coarse-to-fine on a blank canvas to reconstruct one image, then
+tokenizes it: geometry → 128-bin **coordinate tokens**, appearance → a **512-code
+codebook fit to that single image**. Good for animation and as a rendering
+sanity check; the codebook does *not* generalize across images (that's what
+`vocab.py` is for).
 
-![Painting progression](assets/painting_progression.png)
+![Painting the Mona Lisa](assets/drawing_mona_lisa.gif)
 
-*Coarse-to-fine: blurred underpainting → 80 coarse → 140 medium → 220 fine
-strokes.*
+*From a blank white canvas, ~1220 strokes replayed in paint order (coarse
+block-in → fine detail), one batch per frame.*
+
+- One lesson worth keeping: k-means over *absolute stroke position* averages
+  strokes across the image (blocky mush). Snapping position to a coordinate grid
+  instead preserves location and drops tokenized MSE ~4× (0.009 → 0.002).
+
+```bash
+modal run paint.py --steps 250
+modal volume get brush-paint /out ./paint_out    # compare.png, drawing.gif, tokens.json
+```
 
 ## Roadmap
 
 1. ✅ Stroke VQ tokenizer (line sketches).
-2. ✅ Brush-token painter (raster → discrete stroke tokens).
-3. Graft a stroke-token vocabulary onto a small LLM (Qwen2.5-1.5B); interleaved
-   text↔stroke reasoning on a toy spatial task.
-4. Wire the think-visually fold/maze verifiers as reward — does drawing-while-
-   reasoning beat the text-only baseline?
+2. ✅ Differentiable brush painter + renderer.
+3. ✅ **Shared brush-token vocabulary** — learned on a corpus, reconstructs
+   held-out images from a fixed alphabet.
+4. Autoregressive model over brush-token sequences (generate, not just fit).
+5. Graft the vocabulary onto a small LLM (Qwen2.5-1.5B); interleaved text↔stroke
+   reasoning on a spatial task, with the think-visually fold/maze verifiers as
+   reward — does drawing-while-reasoning beat the text-only baseline?
 
 ## Requirements
 
 [Modal](https://modal.com) for compute (`pip install modal`, then
-`modal token new`). QuickDraw data (Google, CC-BY 4.0) and the Mona Lisa
-(Wikimedia, public domain) are fetched at runtime.
+`modal token new`). QuickDraw data (Google, CC-BY 4.0) and public-domain
+paintings (Wikimedia) are fetched at runtime.
 
 ## License
 
