@@ -17,12 +17,22 @@ Changes vs vocab.py (Phase 0 of docs/training-program.md):
      (brush 32, scale 16, x 64, y 64, theta 32, color 256) and re-rendered.
      Reported per image: free MSE (continuous upper bound), vocab MSE (shape+
      scale snapped, placement/color refined), token MSE (everything snapped).
+  5. Null-model control. The vocabulary numbers alone cannot tell whether
+     k-means LEARNED anything: the descriptor space is only 3-D and
+     placement/color are refit continuously, so maybe ANY 32 valid shapes
+     pass the gate. Each held-out image is therefore also painted with
+     --n-rand RANDOM codebooks -- K points drawn uniformly inside the corpus
+     descriptors' per-dim [2%, 98%] box (valid marks, unlearned placement),
+     same snapping protocol, same scale bins. If random codebooks pass the
+     1.5x gate too, the gate is weak evidence of learning; the honest
+     headline is the learned/random MSE ratio.
 
 Gate (docs/training-program.md Phase 0): held-out vocab MSE within ~1.5x of
-the free fit on BOTH a painting and a maze render.
+the free fit on BOTH a painting and a maze render -- now reported alongside
+the random-codebook control at the same protocol.
 
 Run:
-    modal run vocab2.py
+    modal run vocab2.py --n-rand 3
     modal volume get brush-vocab /out ./vocab_out
 """
 
@@ -63,9 +73,10 @@ K_THETA = 32
 GRID = 64
 
 
-@app.function(image=image, volumes={OUT: volume}, gpu="A10G", timeout=10800)
+@app.function(image=image, volumes={OUT: volume}, gpu="A10G", timeout=21600)
 def run(corpus_res: int = 160, heldout_res: int = 200,
-        corpus_steps: int = 120, heldout_steps: int = 180, seed: int = 0):
+        corpus_steps: int = 120, heldout_steps: int = 180, seed: int = 0,
+        n_rand: int = 1):
     import io
     import json
     import numpy as np
@@ -126,16 +137,25 @@ def run(corpus_res: int = 160, heldout_res: int = 200,
         return p0, pm, p1
 
     def render(canvas, xs, ys, p0, pm, p1, w, col, a):
+        # Batched, mathematically exact form of sequential over-compositing:
+        #   canvas_N = canvas_0 * prod_i(1-a_i) + sum_i col_i*a_i*prod_{j>i}(1-a_j)
+        # All coverage fields are computed in one shot (the expensive part);
+        # the sequential recurrence becomes a cumprod. Same output, same
+        # gradients, ~20-50x faster than the per-stroke Python loop.
         n = p0.shape[0]
         soft = 1.2 / canvas.shape[-1]
-        for i in range(n):
-            d1 = seg_dist(xs, ys, p0[i, 0], p0[i, 1], pm[i, 0], pm[i, 1])
-            d2 = seg_dist(xs, ys, pm[i, 0], pm[i, 1], p1[i, 0], p1[i, 1])
-            d = torch.minimum(d1, d2)
-            cov = torch.sigmoid((w[i] * 0.5 - d) / soft)
-            alpha = (a[i] * cov).unsqueeze(0)
-            canvas = canvas * (1 - alpha) + col[i].view(3, 1, 1) * alpha
-        return canvas
+        B = lambda v: v.view(n, 1, 1)
+        d1 = seg_dist(xs, ys, B(p0[:, 0]), B(p0[:, 1]), B(pm[:, 0]), B(pm[:, 1]))
+        d2 = seg_dist(xs, ys, B(pm[:, 0]), B(pm[:, 1]), B(p1[:, 0]), B(p1[:, 1]))
+        d = torch.minimum(d1, d2)                        # (n,H,W)
+        cov = torch.sigmoid((B(w) * 0.5 - d) / soft)
+        alpha = B(a) * cov                               # (n,H,W)
+        keep = 1 - alpha
+        # T[i] = prod_{j>=i} keep_j ; strokes painted after i attenuate it
+        T = torch.flip(torch.cumprod(torch.flip(keep, [0]), 0), [0])
+        T_after = torch.cat([T[1:], torch.ones_like(T[:1])], 0)
+        contrib = torch.einsum("nhw,nc->chw", alpha * T_after, col)
+        return canvas * T[0].unsqueeze(0) + contrib
 
     # ---------------- synthetic task-state targets (we own the generator) ----
     def draw_segments(segs, res, width=0.011, shade=None):
@@ -283,22 +303,23 @@ def run(corpus_res: int = 160, heldout_res: int = 200,
             a = torch.sigmoid(self.a_raw).detach().unsqueeze(-1)
             return torch.cat([col, a], -1)  # (n,4)
 
-    def snap_shape_scale(ratios, L):
-        """ratios (n,3), L (n,) -> frozen (n,4) L,w,bx,by from codebooks."""
-        idx = torch.cdist((ratios - cb_mu) / cb_sd, cb).argmin(1)
-        r = cb[idx] * cb_sd + cb_mu                       # (n,3) w/L,bx/L,by/L
+    def snap_shape_scale(ratios, L, codebook):
+        """ratios (n,3), L (n,) -> frozen (n,4) L,w,bx,by snapped to the
+        given shape codebook (standardized space) + shared scale bins."""
+        idx = torch.cdist((ratios - cb_mu) / cb_sd, codebook).argmin(1)
+        r = codebook[idx] * cb_sd + cb_mu                 # (n,3) w/L,bx/L,by/L
         sbin = (torch.log(L.clamp_min(1e-4)).unsqueeze(1)
                 - scale_bins.log().unsqueeze(0)).abs().argmin(1)
         Lq = scale_bins[sbin]
         fixed = torch.stack([Lq, r[:, 0] * Lq, r[:, 1] * Lq, r[:, 2] * Lq], -1)
         return fixed, idx, sbin
 
-    def paint(target, plan, steps, res, constrain=False):
+    def paint(target, plan, steps, res, codebook=None):
         base = torch.ones(3, res, res, device=dev)
         canvas0 = base.clone()
         all_strokes = []
         for (n, scale) in plan:
-            if not constrain:
+            if codebook is None:
                 st = Strokes(n, scale, target, res)
             else:
                 tmp = Strokes(n, scale, target, res)
@@ -308,7 +329,7 @@ def run(corpus_res: int = 160, heldout_res: int = 200,
                     loss = F.mse_loss(canvas, target)
                     opt.zero_grad(); loss.backward(); opt.step()
                 ratios, L = tmp.descriptors()
-                fixed, idx, sbin = snap_shape_scale(ratios, L)
+                fixed, idx, sbin = snap_shape_scale(ratios, L, codebook)
                 st = Strokes(n, scale, target, res, shape_fixed=fixed)
                 with torch.no_grad():
                     st.o.copy_(tmp.o); st.theta.copy_(tmp.theta)
@@ -445,68 +466,147 @@ def run(corpus_res: int = 160, heldout_res: int = 200,
           f"cross-image {cross}/{K_BRUSHES}, cross-DOMAIN {both_dom}/{K_BRUSHES}, "
           f"palette used {pal_used}/{K_PALETTE}")
 
+    # Null-model control codebooks: K valid-but-unlearned shapes, drawn
+    # uniformly inside the corpus descriptors' per-dim [2%, 98%] box. Only the
+    # shape codebook differs downstream; snapping protocol and scale bins are
+    # shared. If these pass the same held-out gate, the gate is weak evidence
+    # that k-means learned anything.
+    r_lo = torch.quantile(ratios, 0.02, dim=0)
+    r_hi = torch.quantile(ratios, 0.98, dim=0)
+    rand_cbs = [((r_lo + (r_hi - r_lo)
+                  * torch.rand(K_BRUSHES, ratios.shape[1], generator=g,
+                               device=dev)) - cb_mu) / cb_sd
+                for _ in range(max(1, n_rand))]
+
     # ---------------- Stage B: held-out, vocab-constrained + tokenized ------
+    def save_state(results):
+        """Write vocab2.json with everything so far; called incrementally so a
+        timeout/kill mid-run never loses the corpus stage or finished images."""
+        with open(f"{OUT}/vocab2.json", "w") as f:
+            json.dump({
+                "k_brushes": K_BRUSHES, "k_scale": K_SCALE,
+                "k_palette": K_PALETTE, "k_theta": K_THETA, "grid": GRID,
+                "corpus_res": corpus_res, "heldout_res": heldout_res,
+                "corpus_steps": corpus_steps, "heldout_steps": heldout_steps,
+                "descriptor_order": ["width/length", "bend_x/length",
+                                     "bend_y/length"],
+                "codebook_standardized": cb.cpu().tolist(),
+                "codebook_mu": cb_mu.cpu().tolist(),
+                "codebook_sd": cb_sd.cpu().tolist(),
+                "scale_bins": scale_bins.cpu().tolist(),
+                "palette_rgba": palette.cpu().tolist(),
+                "corpus": [f"{n} [{d}]" for (n, d, _) in corpus],
+                "corpus_strokes": M,
+                "usage_entropy_bits": ent,
+                "max_entropy_bits": float(np.log2(K_BRUSHES)),
+                "singletons": singles,
+                "codes_reused_across_images": cross,
+                "codes_reused_across_domains": both_dom,
+                "palette_codes_used": pal_used,
+                "n_rand_codebooks": len(rand_cbs),
+                "heldout": [{"name": r["name"], "domain": r["dom"],
+                             "free_mse": r["mse_f"], "vocab_mse": r["mse_v"],
+                             "rand_mse_mean": r["mse_r"],
+                             "rand_mse_all": r["rand_all"],
+                             "token_mse": r["mse_t"],
+                             "vocab_over_free": r["ratio"],
+                             "rand_over_free": r["ratio_r"],
+                             "learned_over_random_adv": r["adv"],
+                             "gate_1p5x": r["ratio"] <= 1.5,
+                             "rand_gate_1p5x": r["ratio_r"] <= 1.5,
+                             "brushes_used": r["used"]} for r in results],
+            }, f)
+
     results = []
+    save_state(results)   # persist the corpus-stage codebooks immediately
+    volume.commit()
     for (name, dom, tgt) in heldout:
         plan = ho_paint_plan if dom == "paint" else ho_line_plan
         rec_free, _ = paint(tgt, plan, heldout_steps, heldout_res)
         rec_vocab, vstrokes = paint(tgt, plan, heldout_steps, heldout_res,
-                                    constrain=True)
+                                    codebook=cb)
         rec_token = token_render(vstrokes, heldout_res)
         used = sorted(set(int(i) for st in vstrokes for i in st._assigned))
+        # control: identical protocol, random shape codebook(s)
+        rand_mses, rec_rand0 = [], None
+        for ri, rcb in enumerate(rand_cbs):
+            rec_rand, _ = paint(tgt, plan, heldout_steps, heldout_res,
+                                codebook=rcb)
+            rand_mses.append(F.mse_loss(rec_rand, tgt).item())
+            if ri == 0:
+                rec_rand0 = rec_rand
         mse_f = F.mse_loss(rec_free, tgt).item()
         mse_v = F.mse_loss(rec_vocab, tgt).item()
         mse_t = F.mse_loss(rec_token, tgt).item()
+        mse_r = float(np.mean(rand_mses))
         ratio = mse_v / max(mse_f, 1e-8)
+        ratio_r = mse_r / max(mse_f, 1e-8)
+        adv = mse_r / max(mse_v, 1e-8)   # >1: learned codebook beats random
         gate = "PASS" if ratio <= 1.5 else "FAIL"
+        rgate = "PASS" if ratio_r <= 1.5 else "FAIL"
         print(f"HELDOUT [{dom}] {name}: free {mse_f:.4f} | vocab {mse_v:.4f} "
-              f"(x{ratio:.2f} {gate}) | token {mse_t:.4f} | "
-              f"brushes {len(used)}/{K_BRUSHES}")
+              f"(x{ratio:.2f} {gate}) | rand {mse_r:.4f} (x{ratio_r:.2f} "
+              f"{rgate}, n={len(rand_mses)}) | learned/rand adv x{adv:.2f} | "
+              f"token {mse_t:.4f} | brushes {len(used)}/{K_BRUSHES}")
         results.append(dict(name=name, dom=dom, tgt=tgt.cpu(),
                             free=rec_free.cpu(), vocab=rec_vocab.cpu(),
-                            token=rec_token.cpu(), mse_f=mse_f, mse_v=mse_v,
-                            mse_t=mse_t, ratio=ratio, used=len(used)))
+                            rand=rec_rand0.cpu(), token=rec_token.cpu(),
+                            mse_f=mse_f, mse_v=mse_v, mse_t=mse_t,
+                            mse_r=mse_r, rand_all=rand_mses, ratio=ratio,
+                            ratio_r=ratio_r, adv=adv, used=len(used)))
+        save_state(results)
+        volume.commit()   # each finished held-out image survives a kill
 
     # ---------------- figures ----------------
     tile = 64
-    cb_real = cb * cb_sd + cb_mu   # (K,3) ratios
     xs_t, ys_t = grids(tile)
-    cols_n = 8
-    rows_n = (K_BRUSHES + cols_n - 1) // cols_n
-    fig, axes = plt.subplots(rows_n, cols_n, figsize=(cols_n, rows_n))
-    axes = np.array(axes).reshape(-1)
-    L_show = 0.55  # scale-invariant: render every brush at the same length
-    for k in range(K_BRUSHES):
-        wr, bxr, byr = [float(v) for v in cb_real[k]]
-        L = L_show
-        w = max(wr * L, 0.02)
-        o = torch.tensor([[0.5 - L / 2, 0.5]], device=dev)
-        th = torch.zeros(1, device=dev)
-        p0, pm, p1 = world_points(o, th, torch.tensor([L], device=dev),
-                                  torch.tensor([bxr * L], device=dev),
-                                  torch.tensor([byr * L], device=dev))
-        canvas = torch.ones(3, tile, tile, device=dev)
-        canvas = render(canvas, xs_t, ys_t, p0, pm, p1,
-                        torch.tensor([w], device=dev),
-                        torch.tensor([[0.1, 0.1, 0.1]], device=dev),
-                        torch.tensor([1.0], device=dev))
-        axes[k].imshow(canvas.permute(1, 2, 0).cpu().numpy())
-        axes[k].set_title(str(k), fontsize=6); axes[k].axis("off")
-    for j in range(K_BRUSHES, len(axes)):
-        axes[j].axis("off")
-    fig.suptitle(f"Scale-invariant brush alphabet (K={K_BRUSHES}, "
-                 f"rendered at one scale)", fontsize=9)
-    fig.tight_layout()
-    fig.savefig(f"{OUT}/brush_alphabet_v2.png", dpi=130)
+
+    def render_alphabet(codebook_std, path, title):
+        cb_real = codebook_std * cb_sd + cb_mu   # (K,3) ratios
+        cols_n = 8
+        rows_n = (K_BRUSHES + cols_n - 1) // cols_n
+        fig, axes = plt.subplots(rows_n, cols_n, figsize=(cols_n, rows_n))
+        axes = np.array(axes).reshape(-1)
+        L_show = 0.55  # scale-invariant: render every brush at one length
+        for k in range(K_BRUSHES):
+            wr, bxr, byr = [float(v) for v in cb_real[k]]
+            L = L_show
+            w = max(wr * L, 0.02)
+            o = torch.tensor([[0.5 - L / 2, 0.5]], device=dev)
+            th = torch.zeros(1, device=dev)
+            p0, pm, p1 = world_points(o, th, torch.tensor([L], device=dev),
+                                      torch.tensor([bxr * L], device=dev),
+                                      torch.tensor([byr * L], device=dev))
+            canvas = torch.ones(3, tile, tile, device=dev)
+            canvas = render(canvas, xs_t, ys_t, p0, pm, p1,
+                            torch.tensor([w], device=dev),
+                            torch.tensor([[0.1, 0.1, 0.1]], device=dev),
+                            torch.tensor([1.0], device=dev))
+            axes[k].imshow(canvas.permute(1, 2, 0).cpu().numpy())
+            axes[k].set_title(str(k), fontsize=6); axes[k].axis("off")
+        for j in range(K_BRUSHES, len(axes)):
+            axes[j].axis("off")
+        fig.suptitle(title, fontsize=9)
+        fig.tight_layout()
+        fig.savefig(path, dpi=130)
+
+    render_alphabet(cb, f"{OUT}/brush_alphabet_v2.png",
+                    f"Scale-invariant brush alphabet (K={K_BRUSHES}, "
+                    f"rendered at one scale)")
+    render_alphabet(rand_cbs[0], f"{OUT}/brush_alphabet_rand.png",
+                    f"RANDOM control alphabet (K={K_BRUSHES}, "
+                    f"rendered at one scale)")
 
     if results:
-        fig2, ax2 = plt.subplots(len(results), 4,
-                                 figsize=(12, 3 * len(results)))
-        ax2 = np.array(ax2).reshape(len(results), 4)
+        fig2, ax2 = plt.subplots(len(results), 5,
+                                 figsize=(15, 3 * len(results)))
+        ax2 = np.array(ax2).reshape(len(results), 5)
         for i, r in enumerate(results):
             panels = [(r["tgt"], "target"),
                       (r["free"], f"free {r['mse_f']:.4f}"),
                       (r["vocab"], f"vocab {r['mse_v']:.4f} (x{r['ratio']:.2f})"),
+                      (r["rand"], f"random vocab {r['mse_r']:.4f} "
+                                  f"(x{r['ratio_r']:.2f}, n={len(r['rand_all'])})"),
                       (r["token"], f"token {r['mse_t']:.4f}")]
             for j, (im, title) in enumerate(panels):
                 ax2[i, j].imshow(im.permute(1, 2, 0).numpy())
@@ -516,40 +616,18 @@ def run(corpus_res: int = 160, heldout_res: int = 200,
         fig2.tight_layout()
         fig2.savefig(f"{OUT}/heldout_vocab_v2.png", dpi=120)
 
-    with open(f"{OUT}/vocab2.json", "w") as f:
-        json.dump({
-            "k_brushes": K_BRUSHES, "k_scale": K_SCALE,
-            "k_palette": K_PALETTE, "k_theta": K_THETA, "grid": GRID,
-            "descriptor_order": ["width/length", "bend_x/length",
-                                 "bend_y/length"],
-            "codebook_standardized": cb.cpu().tolist(),
-            "codebook_mu": cb_mu.cpu().tolist(),
-            "codebook_sd": cb_sd.cpu().tolist(),
-            "scale_bins": scale_bins.cpu().tolist(),
-            "palette_rgba": palette.cpu().tolist(),
-            "corpus": [f"{n} [{d}]" for (n, d, _) in corpus],
-            "corpus_strokes": M,
-            "usage_entropy_bits": ent,
-            "max_entropy_bits": float(np.log2(K_BRUSHES)),
-            "singletons": singles,
-            "codes_reused_across_images": cross,
-            "codes_reused_across_domains": both_dom,
-            "palette_codes_used": pal_used,
-            "heldout": [{"name": r["name"], "domain": r["dom"],
-                         "free_mse": r["mse_f"], "vocab_mse": r["mse_v"],
-                         "token_mse": r["mse_t"], "vocab_over_free": r["ratio"],
-                         "gate_1p5x": r["ratio"] <= 1.5,
-                         "brushes_used": r["used"]} for r in results],
-        }, f)
-
+    save_state(results)
     volume.commit()
-    print("saved brush_alphabet_v2.png heldout_vocab_v2.png vocab2.json")
+    print("saved brush_alphabet_v2.png brush_alphabet_rand.png "
+          "heldout_vocab_v2.png vocab2.json")
     return {"K": K_BRUSHES, "corpus_strokes": M, "entropy": round(ent, 2),
             "singletons": singles, "cross_image": cross,
             "cross_domain": both_dom, "palette_used": pal_used,
             "heldout": [(r["name"], r["dom"], round(r["mse_v"], 4),
                          f"x{r['ratio']:.2f}",
-                         "PASS" if r["ratio"] <= 1.5 else "FAIL")
+                         "PASS" if r["ratio"] <= 1.5 else "FAIL",
+                         f"rand x{r['ratio_r']:.2f}",
+                         f"adv x{r['adv']:.2f}")
                         for r in results]}
 
 
@@ -559,6 +637,6 @@ def _isp(y):
 
 
 @app.local_entrypoint()
-def main():
-    print("RESULT:", run.remote())
+def main(n_rand: int = 1):
+    print("RESULT:", run.remote(n_rand=n_rand))
     print("pull: modal volume get brush-vocab /out ./vocab_out")
