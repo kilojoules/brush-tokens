@@ -99,9 +99,11 @@ modal volume get brush-paint /out ./paint_out    # compare.png, drawing.gif, tok
    held-out images from a fixed alphabet.
 4. Autoregressive model over brush-token sequences (generate, not just fit) —
    design in [docs/ar-brush-gpt.md](docs/ar-brush-gpt.md).
-5. Graft the vocabulary onto a small LLM (Qwen2.5-1.5B); interleaved text↔stroke
-   reasoning on a spatial task, with the think-visually fold/maze verifiers as
-   reward — does drawing-while-reasoning beat the text-only baseline?
+5. Graft stroke tokens onto small LLMs (Qwen2.5 0.5B–7B); interleaved
+   text↔stroke reasoning on labyrinths with verifier reward — does
+   drawing-while-reasoning beat budget-matched text CoT, and how does the
+   advantage move with maze difficulty and model size? Design:
+   [docs/stroke-cot-scaling.md](docs/stroke-cot-scaling.md).
 
 Full end-to-end plan (phases, gates, confounds, kill criteria):
 [docs/training-program.md](docs/training-program.md).

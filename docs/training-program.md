@@ -108,6 +108,12 @@ rendered drawings match task semantics (verifier-checkable) >80% of the time.
 
 ## Phase 4 — The experiment (~1–2 weeks)
 
+> **Expanded:** phases 3–4 have grown into a full size × difficulty
+> experimental design — see [stroke-cot-scaling.md](stroke-cot-scaling.md).
+> Note its Phase-0 finding: the learned shape codebook ties random codebooks
+> on held-out reconstruction, so phases 0–2 are no longer prerequisites for
+> the reasoning bet.
+
 Verifier-reward RL (GRPO) on fold/maze, reusing think-visually verifiers.
 
 **Conditions (all at matched total token budget):**
